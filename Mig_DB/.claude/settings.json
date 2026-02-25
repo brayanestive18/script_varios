@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''diagnostic_tool_mejorado.py'',''r'',encoding=''utf-8''\\).read\\(\\)\\); print\\(''Sintaxis OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''migration_mariadb.py'',''r'',encoding=''utf-8''\\).read\\(\\)\\); print\\(''Sintaxis OK''\\)\")"
+    ]
+  }
+}
