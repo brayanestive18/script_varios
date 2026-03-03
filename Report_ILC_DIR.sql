@@ -4,6 +4,8 @@ grupos_dir AS (
   SELECT g.id AS grupo_id
   FROM grupo g
   WHERE g.materia IN (34, 48, 55, 65, 68, 69, 74)
+  AND g.id NOT IN (1174,294,516,647) 
+  -- excluir grupos específicos 1174 (11), 294 (OLD), 516 (12), 647 (48) que no corresponden a DIR 
 ),
 -- Total clases válidas por grupo DIR
 tc AS (
