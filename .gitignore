@@ -4,3 +4,6 @@
 
 # Archivos de configuración local (credenciales)
 .env
+*.csv
+*.xlsx
+.DS_Store

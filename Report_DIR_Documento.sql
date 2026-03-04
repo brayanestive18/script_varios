@@ -31,7 +31,7 @@ per_alumno_grupo AS (
     m.id_alumno,
     TRIM(CONCAT(u.nombre1,' ',COALESCE(u.nombre2,''),' ',u.apellido1,' ',COALESCE(u.apellido2,''))) AS nombre,
     m.grupo AS grupo_id,
-    COALESCE(g.title, CONCAT('Grupo ', m.grupo)) AS grupo,
+    CONCAT('Grupo ', m.grupo) AS grupo,
     COALESCE(tc.total_clases,0) AS clases_totales,
     COALESCE(ac.clases_con_asistencia,0) AS clases_con_asistencia,
     ROUND(
