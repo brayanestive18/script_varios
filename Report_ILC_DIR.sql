@@ -42,15 +42,23 @@ ilc AS (
   WHERE g.est_grupo = 1
     AND g.materia NOT IN (34,48,51,53,54,55,65,68,69,71,73,74)
 ),
+-- Matriculaciones en grupos DIR por alumno
+dir_mat AS (
+  SELECT m.id_alumno, m.grupo, mat.nombre AS materia_DIR
+  FROM matricula_materia m
+  JOIN grupos_dir gd ON gd.grupo_id = m.grupo
+  JOIN grupo g ON m.grupo = g.id
+  JOIN materia mat ON g.materia = mat.id
+),
 -- Cruce: alumno ILC con su asistencia en grupo DIR
 per_alumno_grupo AS (
   SELECT
-    m.id_alumno,
+    ilc.id_alumno,
     TRIM(CONCAT(u.nombre1,' ',COALESCE(u.nombre2,''),' ',u.apellido1,' ',COALESCE(u.apellido2,''))) AS nombre,
     ilc.grupo_ILC,
     ilc.materia_ILC,
-    CONCAT('Grupo ', m.grupo) AS grupo_DIR,
-    mat_dir.nombre AS materia_DIR,
+    COALESCE(CONCAT('Grupo ', dm.grupo), 'No matriculado en DIR') AS grupo_DIR,
+    COALESCE(dm.materia_DIR, 'No matriculado en DIR') AS materia_DIR,
     COALESCE(tc.total_clases,0) AS clases_totales,
     COALESCE(ac.clases_con_asistencia,0) AS clases_con_asistencia,
     ROUND(
@@ -59,16 +67,14 @@ per_alumno_grupo AS (
            ELSE 0
       END, 2
     ) AS porcentaje
-  FROM matricula_materia m
-  JOIN grupos_dir gd ON gd.grupo_id = m.grupo
-  JOIN grupo g ON m.grupo = g.id
-  JOIN materia mat_dir ON g.materia = mat_dir.id
-  JOIN alumno al ON m.id_alumno = al.id AND m.dni_alumno = al.dni
+  FROM ilc
+  JOIN alumno al ON ilc.id_alumno = al.id AND ilc.dni_alumno = al.dni
   JOIN usuario u ON al.id = u.id AND al.dni = u.dni
-  JOIN ilc ON ilc.id_alumno = m.id_alumno AND ilc.rn = 1
-  LEFT JOIN tc ON tc.grupo = m.grupo
-  LEFT JOIN ac ON ac.grupo = m.grupo AND ac.id_alumno = m.id_alumno
-  GROUP BY m.id_alumno, nombre, ilc.grupo_ILC, ilc.materia_ILC, m.grupo, mat_dir.nombre, tc.total_clases, ac.clases_con_asistencia
+  LEFT JOIN dir_mat dm ON dm.id_alumno = ilc.id_alumno
+  LEFT JOIN tc ON tc.grupo = dm.grupo
+  LEFT JOIN ac ON ac.grupo = dm.grupo AND ac.id_alumno = ilc.id_alumno
+  WHERE ilc.rn = 1
+  GROUP BY ilc.id_alumno, nombre, ilc.grupo_ILC, ilc.materia_ILC, dm.grupo, dm.materia_DIR, tc.total_clases, ac.clases_con_asistencia
 )
 SELECT id_alumno, nombre, grupo_ILC, materia_ILC, grupo_DIR, materia_DIR, porcentaje, clases_con_asistencia, clases_totales
 FROM (
