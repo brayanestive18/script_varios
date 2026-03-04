@@ -4,8 +4,9 @@ grupos_dir AS (
   SELECT g.id AS grupo_id
   FROM grupo g
   WHERE g.materia IN (34, 48, 55, 65, 68, 69, 74)
-  AND g.id NOT IN (1174,294,516,647) 
-  -- excluir grupos específicos 1174 (11), 294 (OLD), 516 (12), 647 (48) que no corresponden a DIR 
+  AND g.id NOT IN (1174,294,516,519) 
+  -- excluir grupos específicos 1174 (11) Remendado Redes
+  -- 294 (OLD), 516 (12), 647 (48) que no corresponden a DIR 
 ),
 -- Total clases válidas por grupo DIR
 tc AS (
@@ -32,7 +33,7 @@ ilc AS (
   SELECT
     m.id_alumno,
     m.dni_alumno,
-    COALESCE(g.title, CONCAT('Grupo ', m.grupo)) AS grupo_ILC,
+    CONCAT('Grupo ', m.grupo) AS grupo_ILC,
     mat.nombre AS materia_ILC,
     ROW_NUMBER() OVER (PARTITION BY m.id_alumno ORDER BY m.grupo DESC) AS rn
   FROM matricula_materia m
@@ -48,7 +49,7 @@ per_alumno_grupo AS (
     TRIM(CONCAT(u.nombre1,' ',COALESCE(u.nombre2,''),' ',u.apellido1,' ',COALESCE(u.apellido2,''))) AS nombre,
     ilc.grupo_ILC,
     ilc.materia_ILC,
-    COALESCE(g.title, CONCAT('Grupo ', m.grupo)) AS grupo_DIR,
+    CONCAT('Grupo ', m.grupo) AS grupo_DIR,
     mat_dir.nombre AS materia_DIR,
     COALESCE(tc.total_clases,0) AS clases_totales,
     COALESCE(ac.clases_con_asistencia,0) AS clases_con_asistencia,
@@ -67,7 +68,7 @@ per_alumno_grupo AS (
   JOIN ilc ON ilc.id_alumno = m.id_alumno AND ilc.rn = 1
   LEFT JOIN tc ON tc.grupo = m.grupo
   LEFT JOIN ac ON ac.grupo = m.grupo AND ac.id_alumno = m.id_alumno
-  GROUP BY m.id_alumno, nombre, ilc.grupo_ILC, ilc.materia_ILC, m.grupo, g.title, mat_dir.nombre, tc.total_clases, ac.clases_con_asistencia
+  GROUP BY m.id_alumno, nombre, ilc.grupo_ILC, ilc.materia_ILC, m.grupo, mat_dir.nombre, tc.total_clases, ac.clases_con_asistencia
 )
 SELECT id_alumno, nombre, grupo_ILC, materia_ILC, grupo_DIR, materia_DIR, porcentaje, clases_con_asistencia, clases_totales
 FROM (
