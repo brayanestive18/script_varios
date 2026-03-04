@@ -1,0 +1,6 @@
+# Ignorar el ambiente virtual de Python
+.venv/
+*_data/
+
+# Archivos de configuración local (credenciales)
+.env

@@ -1,0 +1,28 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mysql_erp
+    restart: always
+    # Usar el archivo .env para las credenciales
+    env_file:
+      - .env
+    environment:
+      # Contraseña para el usuario 'root' de la base de datos.
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      # Nombre de la base de datos por defecto donde se ejecutará el script
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    ports:
+      # Mapea el puerto 3306 del contenedor al 3306 de tu máquina.
+      - "3306:3306"
+    volumes:
+      # Persiste los datos de la base de datos en un volumen nombrado.
+      - ./mysql_data:/var/lib/mysql
+      # Carga el script SQL para crear las tablas al iniciar por primera vez.
+      - ./clcerp_190226.sql:/docker-entrypoint-initdb.d/init.sql
+      #- ./ERP_DB_TABLES.sql:/docker-entrypoint-initdb.d/init.sql
+
+volumes:
+  mysql_data:
+    driver: local
