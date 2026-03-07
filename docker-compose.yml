@@ -23,6 +23,21 @@ services:
       - ./clcerp_190226.sql:/docker-entrypoint-initdb.d/init.sql
       #- ./ERP_DB_TABLES.sql:/docker-entrypoint-initdb.d/init.sql
 
+  postgres:
+    image: postgres:16
+    container_name: postgres_erp
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${PG_NAME}
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+
 volumes:
   mysql_data:
     driver: local
