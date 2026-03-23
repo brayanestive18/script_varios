@@ -34,6 +34,8 @@ ilc AS (
     m.id_alumno,
     m.dni_alumno,
     CONCAT('Grupo ', m.grupo) AS grupo_ILC,
+    g.dni_maestro,
+    g.id_maestro,
     mat.nombre AS materia_ILC,
     ROW_NUMBER() OVER (PARTITION BY m.id_alumno ORDER BY m.grupo DESC) AS rn
   FROM matricula_materia m
@@ -55,10 +57,12 @@ per_alumno_grupo AS (
   SELECT
     ilc.id_alumno,
     TRIM(CONCAT(u.nombre1,' ',COALESCE(u.nombre2,''),' ',u.apellido1,' ',COALESCE(u.apellido2,''))) AS nombre,
+    u.celular AS celular,
     ilc.grupo_ILC,
     ilc.materia_ILC,
     COALESCE(CONCAT('Grupo ', dm.grupo), 'No matriculado en DIR') AS grupo_DIR,
     COALESCE(dm.materia_DIR, 'No matriculado en DIR') AS materia_DIR,
+    TRIM(CONCAT(um.nombre1,' ',COALESCE(um.nombre2,''),' ',um.apellido1,' ',COALESCE(um.apellido2,''))) AS nombre_profesor,
     COALESCE(tc.total_clases,0) AS clases_totales,
     COALESCE(ac.clases_con_asistencia,0) AS clases_con_asistencia,
     ROUND(
@@ -73,10 +77,12 @@ per_alumno_grupo AS (
   LEFT JOIN dir_mat dm ON dm.id_alumno = ilc.id_alumno
   LEFT JOIN tc ON tc.grupo = dm.grupo
   LEFT JOIN ac ON ac.grupo = dm.grupo AND ac.id_alumno = ilc.id_alumno
+  LEFT JOIN grupo g_dir ON g_dir.id = dm.grupo
+  LEFT JOIN usuario um ON um.id = ilc.id_maestro AND um.dni = ilc.dni_maestro
   WHERE ilc.rn = 1
-  GROUP BY ilc.id_alumno, nombre, ilc.grupo_ILC, ilc.materia_ILC, dm.grupo, dm.materia_DIR, tc.total_clases, ac.clases_con_asistencia
+  GROUP BY ilc.id_alumno, nombre, ilc.grupo_ILC, ilc.materia_ILC, dm.grupo, dm.materia_DIR, nombre_profesor, tc.total_clases, ac.clases_con_asistencia
 )
-SELECT id_alumno, nombre, grupo_ILC, materia_ILC, grupo_DIR, materia_DIR, porcentaje, clases_con_asistencia, clases_totales
+SELECT id_alumno, nombre, celular, grupo_ILC, materia_ILC, grupo_DIR, materia_DIR, nombre_profesor, porcentaje, clases_con_asistencia, clases_totales
 FROM (
   SELECT *,
          ROW_NUMBER() OVER (PARTITION BY id_alumno ORDER BY porcentaje DESC, clases_con_asistencia DESC) AS rn

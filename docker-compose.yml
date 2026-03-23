@@ -2,7 +2,7 @@ services:
   mysql:
     image: mysql:8.0
     container_name: mysql_erp
-    restart: always
+    #restart: always
     # Usar el archivo .env para las credenciales
     env_file:
       - .env
@@ -26,7 +26,7 @@ services:
   postgres:
     image: postgres:16
     container_name: postgres_erp
-    restart: always
+    #restart: always
     env_file:
       - .env
     environment:
