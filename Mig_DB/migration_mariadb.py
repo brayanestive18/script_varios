@@ -8,16 +8,22 @@ Tablas cubiertas: roles, users, user_roles, profiles,
 
 import sys
 import io
+import os
 import uuid
 import traceback
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Tuple, Optional
 
 import mysql.connector
 from mysql.connector import Error as MySQLError
 import psycopg2
 from psycopg2.extras import execute_values
+from dotenv import load_dotenv
+
+_ENV_PATH = Path(__file__).parent.parent / ".env"
+load_dotenv(_ENV_PATH)
 
 # Forzar UTF-8 en consola Windows
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -268,7 +274,7 @@ class MariaDBMigrator:
             cur = self.mariadb_conn.cursor(dictionary=True)
             cur.execute(
                 f"""
-                SELECT id, dni, email, vigente,
+                SELECT id, dni, email, vigente, nombre1, nombre2, apellido1, apellido2,
                        email_verified_at, created_at, updated_at
                 FROM usuario
                 ORDER BY id, dni
@@ -278,12 +284,31 @@ class MariaDBMigrator:
             usuarios = cur.fetchall()
             cur.close()
 
+            # Pre-cargar emails ya existentes en PG para detectar duplicados
+            pg_cur.execute("SELECT email FROM users")
+            seen_emails: set = {row[0] for row in pg_cur.fetchall()}
+
             rows_usuario = []
             key_to_provider: Dict[Tuple[int, int], str] = {}
+            duplicate_log: list = []
 
             for u in usuarios:
                 provider_id = f"erp_usuario_{u['id']}_{u['dni']}"
-                email = u["email"] or f"{provider_id}@noemail.local"
+                raw_email = u["email"] or f"{u['id']}@noemail.co"
+                if raw_email in seen_emails:
+                    # Usar id_dni para garantizar unicidad entre usuarios con mismo nro de doc
+                    email = f"duplicate.{u['id']}_{u['dni']}.{raw_email}"
+                    name = " ".join(filter(None, [u.get("nombre1"), u.get("nombre2"),
+                                                   u.get("apellido1"), u.get("apellido2")]))
+                    duplicate_log.append({
+                        "dni":      u["id"],
+                        "type_dni": self.t_dni_map.get(u["dni"], str(u["dni"])),
+                        "name":     name,
+                        "email":    raw_email,
+                    })
+                else:
+                    email = raw_email
+                seen_emails.add(email)
                 status = "ACTIVE" if u.get("vigente", 1) else "INACTIVE"
                 u_uuid = det_uuid("usuario", f"{u['id']}_{u['dni']}")
 
@@ -297,6 +322,18 @@ class MariaDBMigrator:
                     u["updated_at"] or NOW,
                 ))
                 key_to_provider[(u["id"], u["dni"])] = provider_id
+
+            # Escribir log de emails duplicados
+            if duplicate_log:
+                import csv
+                notif_path = Path(__file__).parent.parent / "notification.csv"
+                write_header = not notif_path.exists()
+                with open(notif_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=["dni", "type_dni", "name", "email"])
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerows(duplicate_log)
+                logger.warning(f"  {len(duplicate_log)} emails duplicados → {notif_path}")
 
             if rows_usuario:
                 execute_values(
@@ -323,6 +360,16 @@ class MariaDBMigrator:
                         self.usuario_id_map[key] = provider_to_pg[provider_id]
 
             # ── 2. Tabla `users` del ERP (auth Laravel → para user_roles)
+            # En modo limitado (pruebas) se omite para no inflar el conteo de users.
+            if self.limit is not None:
+                logger.info("  [modo limitado] Saltando tabla auth users de Laravel")
+                self.postgres_conn.commit()
+                pg_cur.close()
+                self.stats["migrated_tables"] += 1
+                self.stats["migrated_records"] += len(rows_usuario)
+                self.stats["total_records"] += len(usuarios)
+                return True
+
             cur2 = self.mariadb_conn.cursor(dictionary=True)
             cur2.execute(
                 "SELECT id, email, name, email_verified_at, created_at, updated_at"
@@ -336,7 +383,7 @@ class MariaDBMigrator:
 
             for u in auth_users:
                 provider_id = f"erp_auth_{u['id']}"
-                email = u["email"] or f"{provider_id}@noemail.local"
+                email = u["email"] or f"{u['id']}@noemail.co"
                 u_uuid = det_uuid("auth_user", str(u["id"]))
 
                 rows_auth.append((
@@ -506,6 +553,11 @@ class MariaDBMigrator:
             migrated = 0
             skipped = 0
 
+            GENDER_MAP = {"M": "MALE", "F": "FEMALE", "m": "MALE", "f": "FEMALE"}
+
+            # uuid → key ERP para reconstruir el mapa después del insert
+            uuid_to_key: Dict[str, Tuple[int, int]] = {}
+
             for u in rows:
                 key = (u["id"], u["dni"])
                 pg_user_id = self.usuario_id_map.get(key)
@@ -514,27 +566,28 @@ class MariaDBMigrator:
                     continue
 
                 profile_uuid = det_uuid("profile", f"{u['id']}_{u['dni']}")
+                genero_raw = u.get("genero")
+                gender = GENDER_MAP.get(str(genero_raw).strip(), None) if genero_raw else None
 
                 pg_id = self._insert_one_with_savepoint(
                     pg_cur,
                     """
                     INSERT INTO profiles
-                        (uuid, user_id, dni, first_name, middle_name,
+                        (uuid, user_id, first_name, middle_name,
                          last_name, second_last_name, gender, birth_date,
-                         phone, mobile, avatar_url, created_at, updated_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         "homePhoneNumber", "mobilePhoneNumber", avatar_url, created_at, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (uuid) DO NOTHING
                     RETURNING id
                     """,
                     (
                         profile_uuid,
                         pg_user_id,
-                        str(u["id"]),         # nro de documento
                         u["nombre1"],
                         u.get("nombre2"),
                         u["apellido1"],
                         u.get("apellido2"),
-                        u.get("genero"),
+                        gender,
                         u.get("fecha_nacimiento"),
                         u.get("telefono"),
                         u.get("celular"),
@@ -546,6 +599,19 @@ class MariaDBMigrator:
                 if pg_id:
                     self.profile_id_map[key] = pg_id
                     migrated += 1
+                uuid_to_key[profile_uuid] = key
+
+            # Recuperar IDs de profiles que ya existían (ON CONFLICT DO NOTHING no retorna)
+            if uuid_to_key:
+                uuids = list(uuid_to_key.keys())
+                pg_cur.execute(
+                    "SELECT id, uuid::text FROM profiles WHERE uuid::text = ANY(%s)",
+                    (uuids,),
+                )
+                for pg_id, pg_uuid in pg_cur.fetchall():
+                    key = uuid_to_key[pg_uuid]
+                    if key not in self.profile_id_map:
+                        self.profile_id_map[key] = pg_id
 
             self.postgres_conn.commit()
             pg_cur.close()
@@ -624,7 +690,7 @@ class MariaDBMigrator:
                     """
                     INSERT INTO profile_addresses
                         (uuid, profile_id, country, state, city,
-                         "adressType", is_primary, address_line, neighborhood,
+                         address_type, is_primary, address_line, neighborhood,
                          created_at, updated_at)
                     VALUES %s
                     ON CONFLICT (uuid) DO NOTHING
@@ -834,22 +900,43 @@ class MariaDBMigrator:
             pg_cur = self.postgres_conn.cursor()
             to_insert = []
 
+            DNI_TYPE_MAP = {
+                # Abreviaciones exactas de ERP.t_dni
+                "C.C.":  "CEDULA_CIUDADANIA",
+                "T.I.":  "TARJETA_IDENTIDAD",
+                "R.C.":  "REGISTRO_CIVIL",
+                "C.E.":  "CEDULA_EXTRANJERIA",
+                "PSPT.": "PASAPORTE",
+                # Variantes sin puntos
+                "CC":  "CEDULA_CIUDADANIA",
+                "TI":  "TARJETA_IDENTIDAD",
+                "RC":  "REGISTRO_CIVIL",
+                "CE":  "CEDULA_EXTRANJERIA",
+                "PP":  "PASAPORTE", "PAS": "PASAPORTE",
+                "PEP": "PEP",
+                "PPT": "PPT",
+                # NIT no tiene equivalente en el enum de almadb
+            }
+
             for u in rows:
                 key = (u["id"], u["dni"])
                 pg_profile_id = self.profile_id_map.get(key)
                 if pg_profile_id is None:
                     continue
 
-                # Tipo de documento: usar abreviacion si existe, si no el ID como string
-                dni_type = self.t_dni_map.get(u["dni"], str(u["dni"]))
+                raw_dni_type = self.t_dni_map.get(u["dni"], "")
+                dni_type = DNI_TYPE_MAP.get(raw_dni_type.strip().upper(), None) if raw_dni_type else None
+                if dni_type is None:
+                    logger.warning(f"  dni_type desconocido '{raw_dni_type}' para usuario {u['id']} → CEDULA_CIUDADANIA")
+                    dni_type = "CEDULA_CIUDADANIA"
 
                 to_insert.append((
                     det_uuid("profile_dni", f"{u['id']}_{u['dni']}"),
                     pg_profile_id,
                     dni_type,
-                    None,                       # expedition_date: no disponible
-                    u.get("fecha_nacimiento"),  # birthdate
-                    True,                       # is_current
+                    str(u["id"]),   # dni_number = usuario.id (el nro de documento)
+                    None,           # expedition_date: no disponible
+                    True,           # is_current
                     u["created_at"] or NOW,
                     u["updated_at"] or NOW,
                 ))
@@ -859,8 +946,8 @@ class MariaDBMigrator:
                     pg_cur,
                     """
                     INSERT INTO profile_dni
-                        (uuid, profile_id, "dniType", expedition_date,
-                         birthdate, is_current, created_at, updated_at)
+                        (uuid, profile_id, dni_type, dni_number, expedition_date,
+                         is_current, created_at, updated_at)
                     VALUES %s
                     ON CONFLICT (uuid) DO NOTHING
                     """,
@@ -908,7 +995,6 @@ class MariaDBMigrator:
                 self.migrate_profiles,
                 self.migrate_profile_addresses,
                 self.migrate_profile_employment,
-                self.migrate_profile_family,
                 self.migrate_profile_dni,
             ]
 
@@ -945,58 +1031,99 @@ class MariaDBMigrator:
 # Entrada
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _env_complete() -> bool:
+    """Devuelve True si el .env tiene todas las variables requeridas."""
+    required = ["DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME",
+                "PG_HOST", "PG_USER", "PG_PASSWORD", "PG_NAME"]
+    return all(os.getenv(k, "").strip() for k in required)
+
+
+def _config_from_env() -> Dict:
+    return {
+        "mariadb": {
+            "host":     os.getenv("DB_HOST", "localhost"),
+            "port":     int(os.getenv("DB_PORT", "3306")),
+            "user":     os.getenv("DB_USER", "root"),
+            "password": os.getenv("DB_PASSWORD", ""),
+            "database": os.getenv("DB_NAME", "erp"),
+        },
+        "postgres": {
+            "host":     os.getenv("PG_HOST", "localhost"),
+            "port":     int(os.getenv("PG_PORT", "5432")),
+            "user":     os.getenv("PG_USER", "postgres"),
+            "password": os.getenv("PG_PASSWORD", ""),
+            "database": os.getenv("PG_NAME", "almadb"),
+        },
+    }
+
+
 def main():
     print("\n" + "=" * 70)
     print("MIGRACIÓN ERP (MariaDB) → ALMA_BE_V2 (PostgreSQL)".center(70))
     print("=" * 70)
 
-    print("\nMariaDB (ERP):")
-    mariadb_host = input("  Host     [localhost]: ").strip() or "localhost"
-    mariadb_port = int(input("  Puerto   [3306]:      ").strip() or "3306")
-    mariadb_user = input("  Usuario  [app]:       ").strip() or "app"
-    mariadb_pass = input("  Password [apppass]:   ").strip() or "apppass"
-    mariadb_db   = input("  Base     [erp]:       ").strip() or "erp"
+    if _ENV_PATH.exists() and _env_complete():
+        cfg = _config_from_env()
+        mc, pc = cfg["mariadb"], cfg["postgres"]
+        print(f"\n  .env cargado desde: {_ENV_PATH}")
+        print(f"\n  MariaDB   : {mc['user']}@{mc['host']}:{mc['port']}/{mc['database']}")
+        print(f"  PostgreSQL: {pc['user']}@{pc['host']}:{pc['port']}/{pc['database']}")
 
-    print("\nPostgreSQL (almadb):")
-    pg_host = input("  Host     [localhost]: ").strip() or "localhost"
-    pg_port = int(input("  Puerto   [5432]:      ").strip() or "5432")
-    pg_user = input("  Usuario  [postgres]:  ").strip() or "postgres"
-    pg_pass = input("  Password [admin]:     ").strip() or "admin"
-    pg_db   = input("  Base     [almadb]:").strip() or "almadb"
+        raw_limit = input("\n  Límite de usuarios a migrar [vacío = todos]: ").strip()
+        limit: Optional[int] = None
+        if raw_limit:
+            try:
+                limit = int(raw_limit) or None
+            except ValueError:
+                pass
 
-    print("\nCantidad de registros a migrar:")
-    print("  (Se aplica sobre la tabla principal 'usuario'.")
-    print("   Las tablas de roles y permisos se migran completas siempre.)")
-    raw_limit = input("  Cantidad [dejar vacio para todos]: ").strip()
-    limit: Optional[int] = None
-    if raw_limit:
-        try:
-            limit = int(raw_limit)
-            if limit <= 0:
-                print("  Valor invalido, se migraran todos los registros.")
-                limit = None
-            else:
-                print(f"  Se migraran como maximo {limit} personas.")
-        except ValueError:
-            print("  Valor invalido, se migraran todos los registros.")
+        migrator = MariaDBMigrator(
+            mariadb_config=mc,
+            postgres_config=pc,
+            limit=limit,
+        )
+    else:
+        if _ENV_PATH.exists():
+            print(f"\n  .env incompleto — se solicitarán los datos manualmente.")
+        else:
+            print(f"\n  .env no encontrado en {_ENV_PATH} — ingresa los datos manualmente.")
 
-    migrator = MariaDBMigrator(
-        mariadb_config={
-            "host": mariadb_host,
-            "port": mariadb_port,
-            "user": mariadb_user,
-            "password": mariadb_pass,
-            "database": mariadb_db,
-        },
-        postgres_config={
-            "host": pg_host,
-            "port": pg_port,
-            "user": pg_user,
-            "password": pg_pass,
-            "database": pg_db,
-        },
-        limit=limit,
-    )
+        print("\nMariaDB (ERP):")
+        mariadb_host = input("  Host     [localhost]: ").strip() or "localhost"
+        mariadb_port = int(input("  Puerto   [3306]:      ").strip() or "3306")
+        mariadb_user = input("  Usuario  [root]:      ").strip() or "root"
+        mariadb_pass = input("  Password:             ").strip()
+        mariadb_db   = input("  Base     [erp]:       ").strip() or "erp"
+
+        print("\nPostgreSQL (almadb):")
+        pg_host = input("  Host     [localhost]: ").strip() or "localhost"
+        pg_port = int(input("  Puerto   [5432]:      ").strip() or "5432")
+        pg_user = input("  Usuario  [postgres]:  ").strip() or "postgres"
+        pg_pass = input("  Password:             ").strip()
+        pg_db   = input("  Base     [almadb]:    ").strip() or "almadb"
+
+        print("\nCantidad de registros a migrar:")
+        raw_limit = input("  Límite de usuarios [vacío = todos]: ").strip()
+        limit: Optional[int] = None
+        if raw_limit:
+            try:
+                limit = int(raw_limit) or None
+            except ValueError:
+                pass
+
+        migrator = MariaDBMigrator(
+            mariadb_config={
+                "host": mariadb_host, "port": mariadb_port,
+                "user": mariadb_user, "password": mariadb_pass,
+                "database": mariadb_db,
+            },
+            postgres_config={
+                "host": pg_host, "port": pg_port,
+                "user": pg_user, "password": pg_pass,
+                "database": pg_db,
+            },
+            limit=limit,
+        )
 
     sys.exit(0 if migrator.execute_migration() else 1)
 

@@ -42,7 +42,7 @@ ilc AS (
   JOIN grupo g ON m.grupo = g.id
   JOIN materia mat ON g.materia = mat.id
   WHERE g.est_grupo = 1
-    AND g.materia NOT IN (34,48,51,53,54,55,65,68,69,71,73,74)
+    AND g.materia NOT IN (34,42,48,51,53,54,55,65,68,69,71,73,74)
 ),
 -- Matriculaciones en grupos DIR por alumno
 dir_mat AS (

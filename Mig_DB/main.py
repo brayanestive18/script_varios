@@ -19,14 +19,15 @@ BASE_DIR = Path(__file__).parent
 SCRIPTS = {
     "1": ("test_mariadb.py",             "Test de conexión MariaDB"),
     "2": ("diagnostic_tool_mejorado.py", "Diagnóstico avanzado MariaDB"),
-    "3": ("migration_mariadb.py",        "Migración MariaDB → PostgreSQL"),
-    "4": ("setup.py",                    "Instalación y configuración"),
+    "3": ("migration_mariadb.py",        "Migración ERP → ALMA  [Paso 1: users, profiles, roles]"),
+    "4": ("migration_academic.py",       "Migración ERP → ALMA  [Paso 2: módulo académico]"),
+    "5": ("setup.py",                    "Instalación y configuración"),
 }
 
 # Archivos de documentación
 DOCS = {
-    "5": ("SOLUCION_MARIADB.md", "Solución de problemas MariaDB"),
-    "6": ("GUIA_COMPLETA.md",    "Guía completa de uso"),
+    "6": ("SOLUCION_MARIADB.md", "Solución de problemas MariaDB"),
+    "7": ("GUIA_COMPLETA.md",    "Guía completa de uso"),
 }
 
 
@@ -77,7 +78,7 @@ def main():
         clear_screen()
         print_menu()
 
-        choice = input("  Selecciona una opcion (0-6): ").strip()
+        choice = input("  Selecciona una opcion (0-7): ").strip()
 
         if choice == "0":
             print("\n  Hasta luego.\n")
