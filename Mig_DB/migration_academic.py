@@ -52,7 +52,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 NOW = datetime.now()
-BATCH = 1000
+BATCH = 5000
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -237,6 +237,11 @@ class AcademicMigrator:
         try:
             self.pg_conn = psycopg2.connect(**pc)
             self.pg_conn.autocommit = False
+            with self.pg_conn.cursor() as cur:
+                cur.execute("SET synchronous_commit = OFF")
+                cur.execute("SET work_mem = '256MB'")
+                cur.execute("SET maintenance_work_mem = '512MB'")
+            self.pg_conn.commit()
             logger.info("✓ PostgreSQL psycopg2 OK")
         except psycopg2.Error as err:
             logger.error(f"✗ PostgreSQL psycopg2: {err}")
@@ -273,11 +278,13 @@ class AcademicMigrator:
 
     def _rq(self, sql: str) -> pd.DataFrame:
         """Read query from MySQL → DataFrame."""
-        return pd.read_sql(text(sql), self.mysql_engine.connect())
+        with self.mysql_engine.connect() as conn:
+            return pd.read_sql(text(sql), conn)
 
     def _rqpg(self, sql: str) -> pd.DataFrame:
         """Read query from PostgreSQL → DataFrame."""
-        return pd.read_sql(text(sql), self.pg_engine.connect())
+        with self.pg_engine.connect() as conn:
+            return pd.read_sql(text(sql), conn)
 
     def _bulk_write(self, sql: str, rows: list) -> int:
         """Batch insert with execute_values. Returns number of rows sent."""
@@ -285,17 +292,70 @@ class AcademicMigrator:
             return 0
         cur = self.pg_conn.cursor()
         for i in range(0, len(rows), BATCH):
-            execute_values(cur, sql, rows[i : i + BATCH])
+            execute_values(cur, sql, rows[i : i + BATCH], page_size=BATCH)
         cur.close()
         return len(rows)
 
-    def _pg_map_from_uuids(
-        self, table: str, uuids: List[str]
-    ) -> pd.DataFrame:
+    def _bulk_write_returning(self, sql: str, rows: list) -> List[tuple]:
+        """execute_values con RETURNING. Devuelve lista de (id, uuid) sin query extra."""
+        if not rows:
+            return []
+        cur = self.pg_conn.cursor()
+        result: List[tuple] = []
+        for i in range(0, len(rows), BATCH):
+            result.extend(
+                execute_values(cur, sql, rows[i : i + BATCH], page_size=BATCH, fetch=True)
+            )
+        cur.close()
+        return result
+
+    def _copy_insert(self, table: str, columns: List[str], rows: list, conflict_col: str = "uuid") -> int:
         """
-        Dado una lista de UUIDs ya insertados, devuelve DataFrame(uuid, pg_id)
-        consultando la tabla de destino. Útil para reconstruir maps post-insert.
+        COPY vía STDIN a tabla temporal, luego INSERT ON CONFLICT desde temp.
+        3–10x más rápido que execute_values para tablas > 50k filas.
         """
+        if not rows:
+            return 0
+        buf = io.StringIO()
+        for row in rows:
+            parts: List[str] = []
+            for v in row:
+                if v is None:
+                    parts.append(r"\N")
+                elif isinstance(v, bool):
+                    parts.append("t" if v else "f")
+                elif isinstance(v, datetime):
+                    parts.append(v.strftime("%Y-%m-%d %H:%M:%S"))
+                else:
+                    parts.append(
+                        str(v)
+                        .replace("\\", "\\\\")
+                        .replace("\t", "\\t")
+                        .replace("\n", "\\n")
+                        .replace("\r", "")
+                    )
+            buf.write("\t".join(parts) + "\n")
+        buf.seek(0)
+
+        tmp = "_mig_copy_tmp"
+        col_list = ", ".join(f'"{c}"' for c in columns)
+        cur = self.pg_conn.cursor()
+        cur.execute(
+            f"CREATE TEMP TABLE IF NOT EXISTS {tmp} "
+            f"(LIKE {table} INCLUDING DEFAULTS) ON COMMIT DROP"
+        )
+        cur.execute(f"TRUNCATE {tmp}")
+        cur.copy_from(buf, tmp, columns=columns, null=r"\N")
+        cur.execute(
+            f"INSERT INTO {table} ({col_list}) SELECT {col_list} FROM {tmp} "
+            f"ON CONFLICT ({conflict_col}) DO NOTHING"
+        )
+        n = cur.rowcount
+        cur.close()
+        return n
+
+    def _pg_map_from_uuids(self, table: str, uuids: List[str]) -> pd.DataFrame:
+        """Fallback: reconstruye uuid→id consultando la tabla destino."""
         if not uuids:
             return pd.DataFrame({"uuid": pd.Series(dtype=str), "pg_id": pd.Series(dtype="Int64")})
         cur = self.pg_conn.cursor()
@@ -434,7 +494,7 @@ class AcademicMigrator:
             )
 
             # Transformaciones vectorizadas
-            df["uuid"]       = df["id"].apply(lambda x: det_uuid("campus", str(x)))
+            df["uuid"]       = [det_uuid("campus", str(x)) for x in df["id"].values]
             df["status"]     = df["vigente"].fillna(0).astype(bool).map({True: "ACTIVE", False: "INACTIVE"})
             df["created_at"] = pd.to_datetime(df["fecha_trans"]).fillna(NOW)
             df["updated_at"] = NOW
@@ -447,22 +507,21 @@ class AcademicMigrator:
                     "status", "created_at", "updated_at"]
             rows = to_records(df[cols])
 
-            self._bulk_write(
+            returned = self._bulk_write_returning(
                 """
                 INSERT INTO campuses (uuid, name, address, email, phone,
                                       status, created_at, updated_at)
                 VALUES %s
                 ON CONFLICT (uuid) DO UPDATE
                     SET name = EXCLUDED.name, status = EXCLUDED.status
+                RETURNING id, uuid
                 """,
                 rows,
             )
             self.pg_conn.commit()
 
-            # Reconstruir campus_map: erp_sede.id → pg_campuses.id
-            pg_df = self._pg_map_from_uuids("campuses", df["uuid"].tolist())
-            merged = df[["id", "uuid"]].merge(pg_df, on="uuid", how="inner")
-            self.campus_map = merged.set_index("id")["pg_id"].astype("Int64")
+            uuid_pgid = {str(r[1]): r[0] for r in returned}
+            self.campus_map = df.set_index("id")["uuid"].map(uuid_pgid).astype("Int64")
 
             self._log_step("campuses", len(merged), len(df))
             return True
@@ -500,7 +559,7 @@ class AcademicMigrator:
             skipped = before - len(df)
 
             # Transformaciones vectorizadas
-            df["uuid"]       = df.apply(lambda r: det_uuid("campus_space", f"{r['sede']}_{r['id']}"), axis=1)
+            df["uuid"]       = [det_uuid("campus_space", f"{a}_{b}") for a, b in zip(df["sede"].values, df["id"].values)]
             df["code"]       = "S" + df["sede"].astype(str) + "-" + df["id"].astype(str)
             df["name"]       = df["descripcion"].where(df["descripcion"].notna(), df["code"])
             df["type"]       = "CLASSROOM"
@@ -513,7 +572,7 @@ class AcademicMigrator:
                     "type", "status", "created_at", "updated_at"]
             rows = to_records(df[cols])
 
-            self._bulk_write(
+            returned = self._bulk_write_returning(
                 """
                 INSERT INTO campus_spaces
                     (uuid, campus_id, name, code, capacity, type, status,
@@ -521,19 +580,21 @@ class AcademicMigrator:
                 VALUES %s
                 ON CONFLICT (uuid) DO UPDATE
                     SET name = EXCLUDED.name, status = EXCLUDED.status
+                RETURNING id, uuid
                 """,
                 rows,
             )
             self.pg_conn.commit()
 
-            # Reconstruir space_map con clave compuesta "sede_salon"
-            pg_df = self._pg_map_from_uuids("campus_spaces", df["uuid"].tolist())
-            merged = df[["sede", "id", "uuid"]].merge(pg_df, on="uuid", how="inner")
-            self.space_map = merged.apply(
-                lambda r: r["pg_id"], axis=1
+            uuid_pgid = {str(r[1]): r[0] for r in returned}
+            merged = df[["sede", "id", "uuid"]].copy()
+            merged["pg_id"] = merged["uuid"].map(uuid_pgid)
+            merged = merged.dropna(subset=["pg_id"])
+            self.space_map = pd.Series(
+                merged["pg_id"].values,
+                index=merged["sede"].astype(str) + "_" + merged["id"].astype(str),
+                dtype="Int64",
             )
-            self.space_map.index = merged["sede"].astype(str) + "_" + merged["id"].astype(str)
-            self.space_map = self.space_map.astype("Int64")
 
             self._log_step("campus_spaces", len(merged), len(df) + skipped)
             if skipped:
@@ -567,7 +628,7 @@ class AcademicMigrator:
                 """
             )
 
-            df["uuid"]                = df["id"].apply(lambda x: det_uuid("program_course", str(x)))
+            df["uuid"]                = [det_uuid("program_course", str(x)) for x in df["id"].values]
             df["status"]              = df["est_nombre"].map(map_course_status).fillna("ACTIVE")
             df["institute_program_id"] = self.institute_id
             df["created_at"]          = pd.to_datetime(df["created_at"]).fillna(NOW)
@@ -577,7 +638,7 @@ class AcademicMigrator:
                     "status", "valor_matricula", "creditos", "created_at", "updated_at"]
             rows = to_records(df[cols])
 
-            self._bulk_write(
+            returned = self._bulk_write_returning(
                 """
                 INSERT INTO program_courses
                     (uuid, institute_program_id, name, description, status,
@@ -585,14 +646,14 @@ class AcademicMigrator:
                 VALUES %s
                 ON CONFLICT (uuid) DO UPDATE
                     SET name = EXCLUDED.name, status = EXCLUDED.status
+                RETURNING id, uuid
                 """,
                 rows,
             )
             self.pg_conn.commit()
 
-            pg_df = self._pg_map_from_uuids("program_courses", df["uuid"].tolist())
-            merged = df[["id", "uuid"]].merge(pg_df, on="uuid", how="inner")
-            self.course_map = merged.set_index("id")["pg_id"].astype("Int64")
+            uuid_pgid = {str(r[1]): r[0] for r in returned}
+            self.course_map = df.set_index("id")["uuid"].map(uuid_pgid).astype("Int64")
 
             self._log_step("program_courses", len(merged), len(df))
             return True
@@ -636,9 +697,10 @@ class AcademicMigrator:
             df = df.dropna(subset=["course_id", "req_id"])
             skipped = before - len(df)
 
-            df["uuid"] = df.apply(
-                lambda r: det_uuid("course_req", f"{r['type']}_{r['materia']}_{r['req']}"), axis=1
-            )
+            df["uuid"] = [
+                det_uuid("course_req", f"{t}_{m}_{r}")
+                for t, m, r in zip(df["type"].values, df["materia"].values, df["req"].values)
+            ]
             df["course_id"] = df["course_id"].astype(int)
             df["req_id"]    = df["req_id"].astype(int)
 
@@ -678,10 +740,12 @@ class AcademicMigrator:
                        h.dia, h.hora_inicio, h.salon,
                        g.fecha_trans     AS created_at,
                        g.fecha_modificar AS updated_at,
-                       (SELECT COUNT(*) FROM clase c WHERE c.grupo = g.id)
-                           AS planned_sessions
+                       COALESCE(sc.cnt, 0) AS planned_sessions
                 FROM grupo g
                 LEFT JOIN est_grupo eg ON eg.id = g.est_grupo
+                LEFT JOIN (
+                    SELECT grupo, COUNT(*) AS cnt FROM clase GROUP BY grupo
+                ) sc ON sc.grupo = g.id
                 LEFT JOIN horario_grupo h
                     ON h.grupo = g.id
                     AND h.id = (SELECT MIN(h2.id) FROM horario_grupo h2 WHERE h2.grupo = g.id)
@@ -703,7 +767,7 @@ class AcademicMigrator:
             skipped = before - len(df)
 
             # Transformaciones vectorizadas
-            df["uuid"]              = df["id"].apply(lambda x: det_uuid("course_group", str(x)))
+            df["uuid"]              = [det_uuid("course_group", str(x)) for x in df["id"].values]
             df["public_id"]         = df["title"].where(df["title"].notna(), "G-" + df["id"].astype(str))
             df["groupStatus"]       = df["est_nombre"].map(map_group_status).fillna("ACTIVE")
             df["attendance_mode"]   = "IN_PERSON"       # CourseAttendanceMode
@@ -726,7 +790,7 @@ class AcademicMigrator:
             ]
             rows = to_records(df[cols])
 
-            self._bulk_write(
+            returned = self._bulk_write_returning(
                 """
                 INSERT INTO course_groups
                     (uuid, public_id, program_course_id, campus_id, campus_space_id,
@@ -738,14 +802,14 @@ class AcademicMigrator:
                 ON CONFLICT (uuid) DO UPDATE
                     SET "groupStatus" = EXCLUDED."groupStatus",
                         public_id     = EXCLUDED.public_id
+                RETURNING id, uuid
                 """,
                 rows,
             )
             self.pg_conn.commit()
 
-            pg_df = self._pg_map_from_uuids("course_groups", df["uuid"].tolist())
-            merged = df[["id", "uuid"]].merge(pg_df, on="uuid", how="inner")
-            self.group_map = merged.set_index("id")["pg_id"].astype("Int64")
+            uuid_pgid = {str(r[1]): r[0] for r in returned}
+            self.group_map = df.set_index("id")["uuid"].map(uuid_pgid).astype("Int64")
 
             self._log_step("course_groups", len(merged), before)
             if skipped:
@@ -788,13 +852,12 @@ class AcademicMigrator:
             skipped = before - len(df)
 
             # session_number: pandas groupby cumcount (sin window function en SQL)
-            df = df.sort_values(["curso_group_id" if "curso_group_id" in df.columns
-                                 else "course_group_id", "fecha_inicio", "id"])
+            df = df.sort_values(["course_group_id", "fecha_inicio", "id"])
             df["session_number"] = (
                 df.groupby("course_group_id").cumcount() + 1
             )
 
-            df["uuid"]          = df["id"].apply(lambda x: det_uuid("group_session", str(x)))
+            df["uuid"]          = [det_uuid("group_session", str(x)) for x in df["id"].values]
             df["sessionStatus"] = df["est_nombre"].map(map_session_status).fillna("SCHEDULED")
             df["course_group_id"] = df["course_group_id"].astype(int)
             df["created_at"]    = pd.to_datetime(df["created_at"]).fillna(NOW)
@@ -805,25 +868,24 @@ class AcademicMigrator:
                     "sessionStatus", "hora_inicio", "created_at", "updated_at"]
             rows = to_records(df[cols])
 
-            self._bulk_write(
+            returned = self._bulk_write_returning(
                 """
                 INSERT INTO group_sessions
                     (uuid, course_group_id, session_number, session_date,
                      "sessionStatus", session_hour, created_at, updated_at)
                 VALUES %s
-                ON CONFLICT (uuid) DO NOTHING
+                ON CONFLICT (uuid) DO UPDATE SET session_date = EXCLUDED.session_date
+                RETURNING id, uuid
                 """,
                 rows,
             )
             self.pg_conn.commit()
 
-            # Reconstruir session_map — clase.id no es único globalmente (PK compuesta grupo+id)
-            pg_df = self._pg_map_from_uuids("group_sessions", df["uuid"].tolist())
-            merged = df[["id", "uuid"]].merge(pg_df, on="uuid", how="inner")
-            merged = merged.drop_duplicates(subset=["id"], keep="first")
-            self.session_map = merged.set_index("id")["pg_id"].astype("Int64")
+            uuid_pgid = {str(r[1]): r[0] for r in returned}
+            tmp = df[["id", "uuid"]].drop_duplicates(subset=["id"], keep="first")
+            self.session_map = tmp.set_index("id")["uuid"].map(uuid_pgid).astype("Int64")
 
-            self._log_step("group_sessions", len(merged), before)
+            self._log_step("group_sessions", len(uuid_pgid), before)
             if skipped:
                 logger.warning(f"  Omitidos sin grupo mapeado: {skipped}")
             return True
@@ -908,13 +970,10 @@ class AcademicMigrator:
             # Deduplicar (misma combinación grupo+perfil+rol)
             df = df.drop_duplicates(subset=["course_group_id", "profile_id", "role"])
 
-            df["uuid"] = df.apply(
-                lambda r: det_uuid(
-                    "group_profile",
-                    f"{r['erp_grupo']}_{r['usuario_id']}_{r['role']}"
-                ),
-                axis=1,
-            )
+            df["uuid"] = [
+                det_uuid("group_profile", f"{a}_{b}_{c}")
+                for a, b, c in zip(df["erp_grupo"].values, df["usuario_id"].values, df["role"].values)
+            ]
             df["course_group_id"] = df["course_group_id"].astype(int)
             df["profile_id"]      = df["profile_id"].astype(int)
             df["created_at"]      = NOW
@@ -962,51 +1021,52 @@ class AcademicMigrator:
                 "ORDER BY ac.clase, ac.id_alumno"
             )
 
-            # Valor booleano según tipo_asistencia: considera valores comunes del ERP
             PRESENT = {"1", "a", "asistio", "asistió", "p", "presente", "true"}
+            GPA_COLS = ["uuid", "group_session_id", "profile_id", "attended", "created_at", "updated_at"]
+
+            # Crear tabla temporal reutilizable para COPY por chunks
+            with self.pg_conn.cursor() as cur:
+                cur.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS _mig_gpa ("
+                    "  uuid text, group_session_id int, profile_id int, "
+                    "  attended bool, created_at timestamptz, updated_at timestamptz"
+                    ") ON COMMIT DELETE ROWS"
+                )
+            self.pg_conn.commit()
 
             total, migrated, skipped = 0, 0, 0
 
-            for chunk in pd.read_sql(text(sql), self.mysql_engine.connect(), chunksize=5_000):
-                total += len(chunk)
+            with self.mysql_engine.connect() as _conn:
+                for chunk in pd.read_sql(text(sql), _conn, chunksize=20_000):
+                    chunk_total = len(chunk)
+                    total += chunk_total
 
-                chunk["group_session_id"] = chunk["clase"].map(self.session_map)
-                chunk["profile_id"]       = chunk["id_alumno"].map(self.profile_map)
-                chunk = chunk.dropna(subset=["group_session_id", "profile_id"])
-                skipped += (len(chunk) - len(chunk))   # ya droppeados antes
+                    chunk["group_session_id"] = chunk["clase"].map(self.session_map)
+                    chunk["profile_id"]       = chunk["id_alumno"].map(self.profile_map)
+                    chunk = chunk.dropna(subset=["group_session_id", "profile_id"])
+                    skipped += chunk_total - len(chunk)
 
-                # attended: vectorizado sobre tipo_asistencia
-                chunk["attended"] = (
-                    chunk["tipo_asistencia"]
-                    .astype(str)
-                    .str.strip()
-                    .str.lower()
-                    .isin(PRESENT)
-                )
+                    chunk["attended"] = (
+                        chunk["tipo_asistencia"]
+                        .astype(str).str.strip().str.lower().isin(PRESENT)
+                    )
+                    chunk["uuid"] = [
+                        det_uuid("assistance", f"{a}_{b}")
+                        for a, b in zip(chunk["clase"].values, chunk["id_alumno"].values)
+                    ]
+                    chunk["group_session_id"] = chunk["group_session_id"].astype(int)
+                    chunk["profile_id"]       = chunk["profile_id"].astype(int)
+                    chunk["created_at"]       = pd.to_datetime(chunk["created_at"]).fillna(NOW)
+                    chunk["updated_at"]       = pd.to_datetime(chunk["updated_at"]).fillna(NOW)
 
-                chunk["uuid"] = chunk.apply(
-                    lambda r: det_uuid("assistance", f"{r['clase']}_{r['id_alumno']}"), axis=1
-                )
-                chunk["group_session_id"] = chunk["group_session_id"].astype(int)
-                chunk["profile_id"]       = chunk["profile_id"].astype(int)
-                chunk["created_at"]       = pd.to_datetime(chunk["created_at"]).fillna(NOW)
-                chunk["updated_at"]       = pd.to_datetime(chunk["updated_at"]).fillna(NOW)
+                    rows = to_records(chunk[GPA_COLS])
+                    # COPY a temp + upsert desde temp → tabla real (más rápido que execute_values)
+                    n = self._copy_insert(
+                        "group_profile_assistance", GPA_COLS, rows, conflict_col="uuid"
+                    )
+                    migrated += n
+                    self.pg_conn.commit()   # commit por chunk: libera WAL y memoria
 
-                rows = to_records(chunk[["uuid", "group_session_id", "profile_id",
-                                         "attended", "created_at", "updated_at"]])
-                self._bulk_write(
-                    """
-                    INSERT INTO group_profile_assistance
-                        (uuid, group_session_id, profile_id, attended,
-                         created_at, updated_at)
-                    VALUES %s
-                    ON CONFLICT (uuid) DO NOTHING
-                    """,
-                    rows,
-                )
-                migrated += len(rows)
-
-            self.pg_conn.commit()
             self._log_step("group_profile_assistance", migrated, total)
             return True
 
@@ -1039,7 +1099,7 @@ class AcademicMigrator:
             df_mat["resource_scope"]  = "COURSE"
             df_mat["course_id"]       = df_mat["materia_id"].map(self.course_map)
             df_mat["name"]            = df_mat["titulo"].where(df_mat["titulo"].notna(), df_mat["url"])
-            df_mat["uuid"]            = df_mat["id"].apply(lambda x: det_uuid("media_mat", str(x)))
+            df_mat["uuid"]            = [det_uuid("media_mat", str(x)) for x in df_mat["id"].values]
             df_mat["created_at"]      = pd.to_datetime(df_mat["created_at"]).fillna(NOW)
             df_mat["updated_at"]      = NOW
 
@@ -1067,7 +1127,7 @@ class AcademicMigrator:
             df_vid["resource_type"]   = "VIDEO"
             df_vid["resource_status"] = "ACTIVE"
             df_vid["resource_scope"]  = "SESSION"
-            df_vid["uuid"]            = df_vid["clase_id"].apply(lambda x: det_uuid("media_video", str(x)))
+            df_vid["uuid"]            = [det_uuid("media_video", str(x)) for x in df_vid["clase_id"].values]
             df_vid["created_at"]      = pd.to_datetime(df_vid["created_at"]).fillna(NOW)
             df_vid["updated_at"]      = NOW
 
@@ -1087,25 +1147,28 @@ class AcademicMigrator:
             df_all = df_all.drop_duplicates(subset=["uuid"])
             df_all["course_id"] = df_all["course_id"].astype(int)
             rows = to_records(df_all)
-            self._bulk_write(
+            returned = self._bulk_write_returning(
                 """
                 INSERT INTO course_media_resources
                     (uuid, name, url, resource_type, resource_status,
                      resource_scope, course_id, created_at, updated_at)
                 VALUES %s
                 ON CONFLICT (uuid) DO UPDATE SET url = EXCLUDED.url
+                RETURNING id, uuid
                 """,
                 rows,
             )
             self.pg_conn.commit()
 
-            # Reconstruir media_url_map: url → pg_id
-            pg_df = self._pg_map_from_uuids("course_media_resources", df_all["uuid"].tolist())
-            merged = df_all[["uuid", "url"]].merge(pg_df, on="uuid", how="inner")
-            self.media_url_map = dict(zip(merged["url"], merged["pg_id"]))
+            uuid_pgid = {str(r[1]): r[0] for r in returned}
+            self.media_url_map = {
+                url: uuid_pgid[uid]
+                for uid, url in zip(df_all["uuid"], df_all["url"])
+                if uid in uuid_pgid
+            }
 
             self._log_step(
-                "course_media_resources", len(merged),
+                "course_media_resources", len(uuid_pgid),
                 len(df_mat) + len(df_vid)
             )
             logger.info(f"  Detalle: {len(df_mat)} materiales + {len(df_vid)} videos de clase")
@@ -1145,9 +1208,10 @@ class AcademicMigrator:
             df["released_at"] = pd.to_datetime(
                 df["fecha_asistencia"].where(df["fecha_asistencia"].notna(), df["fecha_inicio"])
             ).fillna(pd.NaT)
-            df["uuid"] = df.apply(
-                lambda r: det_uuid("session_video", f"{r['clase_id']}_{r['url'][:64]}"), axis=1
-            )
+            df["uuid"] = [
+                det_uuid("session_video", f"{a}_{b[:64]}")
+                for a, b in zip(df["clase_id"].values, df["url"].values)
+            ]
             df["group_session_id"]  = df["group_session_id"].astype(int)
             df["media_resource_id"] = df["media_resource_id"].astype(int)
             df["created_at"]        = NOW
@@ -1209,9 +1273,10 @@ class AcademicMigrator:
 
             df["course_group_id"]   = df["course_group_id"].astype(int)
             df["media_resource_id"] = df["media_resource_id"].astype(int)
-            df["uuid"] = (
-                df["course_group_id"].astype(str) + "_" + df["media_resource_id"].astype(str)
-            ).apply(lambda k: det_uuid("cgmr", k))
+            df["uuid"] = [
+                det_uuid("cgmr", f"{a}_{b}")
+                for a, b in zip(df["course_group_id"].values, df["media_resource_id"].values)
+            ]
             df["released_at"]       = None
             df["created_at"]        = NOW
             df["updated_at"]        = NOW
