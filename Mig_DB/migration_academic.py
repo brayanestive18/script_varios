@@ -10,8 +10,7 @@ Tablas cubiertas (orden FK estricto):
   program_courses, course_requirements,
   course_groups, group_sessions,
   group_profiles, group_profile_assistance,
-  course_media_resources, group_session_videos,
-  course_group_media_resources
+  course_media_resources, group_session_videos
 
 Prerequisito: migration_mariadb.py debe haberse ejecutado primero.
 """
@@ -37,7 +36,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
 import psycopg2
-from psycopg2.extras import execute_values
+from psycopg2.extras import execute_values  # noqa: F401 – usado en migrate_group_sessions
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
@@ -132,27 +131,16 @@ def map_group_status(estado: Optional[str]) -> str:
 
 
 def map_session_status(estado: Optional[str]) -> str:
+    # Enum GroupSessionStatus: PENDING, COMPLETED, CANCELLED, RESCHEDULED
     if not estado:
-        return "SCHEDULED"
+        return "PENDING"
     s = estado.strip().lower()
     if any(w in s for w in ("cancelad", "cancel")):
         return "CANCELLED"
     if any(w in s for w in ("realiz", "complet", "dictad", "finish")):
         return "COMPLETED"
-    return "SCHEDULED"
+    return "PENDING"
 
-
-def map_material_type(tipo: Optional[str]) -> str:
-    if not tipo:
-        return "DOCUMENT"
-    s = tipo.strip().lower()
-    if "video" in s:
-        return "VIDEO"
-    if "audio" in s:
-        return "AUDIO"
-    if any(w in s for w in ("enlace", "link", "url")):
-        return "LINK"
-    return "DOCUMENT"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -191,7 +179,7 @@ class AcademicMigrator:
 
         self.course_map: pd.Series = pd.Series(dtype="Int64")
         self.group_map: pd.Series = pd.Series(dtype="Int64")
-        self.session_map: pd.Series = pd.Series(dtype="Int64")
+        self.session_map: Dict[tuple, int] = {}   # {(grupo, clase.id) → pg group_session.id}
         self.media_url_map: Dict[str, int] = {}
 
         self.institute_id: Optional[int] = None
@@ -201,7 +189,6 @@ class AcademicMigrator:
         self.est_clase_ser: pd.Series = pd.Series(dtype=str)
         self.est_materia_ser: pd.Series = pd.Series(dtype=str)
         self.est_salon_ser: pd.Series = pd.Series(dtype=str)
-        self.t_material_ser: pd.Series = pd.Series(dtype=str)
 
         self.stats = {
             "migrated_tables": 0,
@@ -276,10 +263,24 @@ class AcademicMigrator:
     def _limit_sql(self) -> str:
         return f"LIMIT {self.limit}" if self.limit is not None else ""
 
-    def _rq(self, sql: str) -> pd.DataFrame:
-        """Read query from MySQL → DataFrame."""
-        with self.mysql_engine.connect() as conn:
-            return pd.read_sql(text(sql), conn)
+    def _rq(self, sql: str, label: str = "") -> pd.DataFrame:
+        """Read query from MySQL → DataFrame.
+
+        stream_results=True: MySQL envía filas en streaming en lugar de
+        bufferear el resultado completo antes de responder — mucho más rápido
+        y eficiente en memoria para tablas grandes.
+        """
+        _label = label or "query"
+        chunks: list = []
+        rows_read = 0
+        with self.mysql_engine.connect().execution_options(stream_results=True) as conn:
+            for chunk in pd.read_sql(text(sql), conn, chunksize=10_000):
+                chunks.append(chunk)
+                rows_read += len(chunk)
+                logger.info(f"  [{_label}] {rows_read:,} filas leídas...")
+        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+        logger.info(f"  [{_label}] fetch completo: {len(df):,} filas")
+        return df
 
     def _rqpg(self, sql: str) -> pd.DataFrame:
         """Read query from PostgreSQL → DataFrame."""
@@ -407,13 +408,6 @@ class AcademicMigrator:
             except Exception as err:
                 logger.warning(f"  No se pudo cargar {table}: {err}")
 
-        try:
-            df = self._rq("SELECT id, tipo FROM t_material")
-            self.t_material_ser = df.set_index("id")["tipo"]
-            logger.info(f"  lookup t_material: {len(df)} filas")
-        except Exception as err:
-            logger.warning(f"  No se pudo cargar t_material: {err}")
-
     def _rebuild_profile_map(self):
         """
         Reconstruye el mapa erp_usuario.id → pg_profiles.id desde PostgreSQL.
@@ -490,7 +484,8 @@ class AcademicMigrator:
         try:
             df = self._rq(
                 "SELECT id, nombre, direccion, email, telefono, vigente, fecha_trans"
-                " FROM sede ORDER BY id"
+                " FROM sede ORDER BY id",
+                label="sede",
             )
 
             # Transformaciones vectorizadas
@@ -502,6 +497,14 @@ class AcademicMigrator:
             df["email"] = df["email"].fillna(
                 df["nombre"].str.lower().str.replace(r"\s+", "", regex=True) + "@noemail.co"
             )
+            # Deduplicar emails: los duplicados quedan como {id}.dup.{email}
+            dup_mask = df["email"].duplicated(keep="first")
+            if dup_mask.any():
+                dup_count = dup_mask.sum()
+                df.loc[dup_mask, "email"] = (
+                    df.loc[dup_mask, "id"].astype(str) + ".dup." + df.loc[dup_mask, "email"]
+                )
+                logger.warning(f"  {dup_count} emails de sede duplicados renombrados con patrón {{id}}.dup.{{email}}")
 
             cols = ["uuid", "nombre", "direccion", "email", "telefono",
                     "status", "created_at", "updated_at"]
@@ -523,7 +526,7 @@ class AcademicMigrator:
             uuid_pgid = {str(r[1]): r[0] for r in returned}
             self.campus_map = df.set_index("id")["uuid"].map(uuid_pgid).astype("Int64")
 
-            self._log_step("campuses", len(merged), len(df))
+            self._log_step("campuses", len(uuid_pgid), len(df))
             return True
 
         except Exception as err:
@@ -549,7 +552,8 @@ class AcademicMigrator:
                 FROM salon s
                 LEFT JOIN est_salon es ON es.id = s.est_salon
                 ORDER BY s.sede, s.id
-                """
+                """,
+                label="salon",
             )
 
             # Mapear campus_id y descartar sin sede
@@ -625,7 +629,8 @@ class AcademicMigrator:
                 FROM materia m
                 LEFT JOIN est_materia em ON em.id = m.est_materia
                 ORDER BY m.id
-                """
+                """,
+                label="materia",
             )
 
             df["uuid"]                = [det_uuid("program_course", str(x)) for x in df["id"].values]
@@ -655,7 +660,7 @@ class AcademicMigrator:
             uuid_pgid = {str(r[1]): r[0] for r in returned}
             self.course_map = df.set_index("id")["uuid"].map(uuid_pgid).astype("Int64")
 
-            self._log_step("program_courses", len(merged), len(df))
+            self._log_step("program_courses", len(uuid_pgid), len(df))
             return True
 
         except Exception as err:
@@ -751,7 +756,8 @@ class AcademicMigrator:
                     AND h.id = (SELECT MIN(h2.id) FROM horario_grupo h2 WHERE h2.grupo = g.id)
                 ORDER BY g.id
                 {self._limit_sql()}
-                """
+                """,
+                label="grupo",
             )
 
             # Mapeos vectorizados FK
@@ -811,7 +817,7 @@ class AcademicMigrator:
             uuid_pgid = {str(r[1]): r[0] for r in returned}
             self.group_map = df.set_index("id")["uuid"].map(uuid_pgid).astype("Int64")
 
-            self._log_step("course_groups", len(merged), before)
+            self._log_step("course_groups", len(uuid_pgid), before)
             if skipped:
                 logger.warning(f"  Omitidos sin materia mapeada: {skipped}")
             return True
@@ -832,60 +838,86 @@ class AcademicMigrator:
         logger.info("\n" + "=" * 60)
         logger.info("MIGRANDO: group_sessions  ←  clase")
         try:
-            df = self._rq(
-                """
+            # ROW_NUMBER() en SQL elimina el groupby+cumcount en pandas
+            # → no se carga toda la tabla en memoria, se puede leer por chunks
+            sql = text("""
                 SELECT c.id, c.grupo, c.fecha_inicio,
                        ec.estado AS est_nombre,
                        h.hora_inicio,
                        c.fecha_inicio                              AS created_at,
-                       COALESCE(c.fecha_cancelar, c.fecha_asistencia) AS updated_at
+                       COALESCE(c.fecha_cancelar, c.fecha_asistencia) AS updated_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY c.grupo
+                           ORDER BY c.fecha_inicio, c.id
+                       ) AS session_number
                 FROM clase c
                 LEFT JOIN est_clase ec ON ec.id = c.est_clase
-                LEFT JOIN horario_grupo h ON h.id = c.horario
+                LEFT JOIN horario_grupo h ON h.grupo = c.grupo AND h.id = c.horario
                 ORDER BY c.grupo, c.fecha_inicio, c.id
-                """
-            )
+            """)
 
-            df["course_group_id"] = df["grupo"].map(self.group_map)
-            before = len(df)
-            df = df.dropna(subset=["course_group_id"])
-            skipped = before - len(df)
-
-            # session_number: pandas groupby cumcount (sin window function en SQL)
-            df = df.sort_values(["course_group_id", "fecha_inicio", "id"])
-            df["session_number"] = (
-                df.groupby("course_group_id").cumcount() + 1
-            )
-
-            df["uuid"]          = [det_uuid("group_session", str(x)) for x in df["id"].values]
-            df["sessionStatus"] = df["est_nombre"].map(map_session_status).fillna("SCHEDULED")
-            df["course_group_id"] = df["course_group_id"].astype(int)
-            df["created_at"]    = pd.to_datetime(df["created_at"]).fillna(NOW)
-            df["updated_at"]    = pd.to_datetime(df["updated_at"]).fillna(NOW)
-
-            # hora_inicio: Timedelta → "HH:MM:SS" via to_records
-            cols = ["uuid", "course_group_id", "session_number", "fecha_inicio",
-                    "sessionStatus", "hora_inicio", "created_at", "updated_at"]
-            rows = to_records(df[cols])
-
-            returned = self._bulk_write_returning(
-                """
+            INSERT_SQL = """
                 INSERT INTO group_sessions
                     (uuid, course_group_id, session_number, session_date,
                      "sessionStatus", session_hour, created_at, updated_at)
                 VALUES %s
                 ON CONFLICT (uuid) DO UPDATE SET session_date = EXCLUDED.session_date
                 RETURNING id, uuid
-                """,
-                rows,
-            )
-            self.pg_conn.commit()
+            """
+            cols = ["uuid", "course_group_id", "session_number", "fecha_inicio",
+                    "sessionStatus", "hora_inicio", "created_at", "updated_at"]
 
-            uuid_pgid = {str(r[1]): r[0] for r in returned}
-            tmp = df[["id", "uuid"]].drop_duplicates(subset=["id"], keep="first")
-            self.session_map = tmp.set_index("id")["uuid"].map(uuid_pgid).astype("Int64")
+            total, migrated, skipped = 0, 0, 0
+            uuid_pgid: dict = {}          # uuid_str → pg_id  (para session_map)
+            erp_uuid_map: dict = {}       # erp_clase.id → uuid_str
 
-            self._log_step("group_sessions", len(uuid_pgid), before)
+            with self.mysql_engine.connect() as conn:
+                total_rows = conn.execute(text("SELECT COUNT(*) FROM clase")).scalar() or 0
+                logger.info(f"  Total filas en clase: {total_rows:,}")
+
+            with self.mysql_engine.connect() as conn:
+                for chunk in pd.read_sql(sql, conn, chunksize=20_000):
+                    chunk_total = len(chunk)
+                    total += chunk_total
+
+                    chunk["course_group_id"] = chunk["grupo"].map(self.group_map)
+                    # clase tiene PK compuesta (grupo, id): la identidad de una
+                    # sesión es (grupo, id), no id solo.
+                    valid = chunk.dropna(subset=["course_group_id"]).drop_duplicates(subset=["grupo", "id"])
+                    skipped += chunk_total - len(valid)
+                    if valid.empty:
+                        continue
+
+                    valid = valid.copy()
+                    valid["uuid"]           = [det_uuid("group_session", f"{g}_{i}")
+                                               for g, i in zip(valid["grupo"].values, valid["id"].values)]
+                    valid["sessionStatus"]  = valid["est_nombre"].map(map_session_status).fillna("PENDING")
+                    valid["course_group_id"] = valid["course_group_id"].astype(int)
+                    valid["created_at"]     = pd.to_datetime(valid["created_at"]).fillna(NOW)
+                    valid["updated_at"]     = pd.to_datetime(valid["updated_at"]).fillna(NOW)
+
+                    rows = to_records(valid[cols])
+                    cur = self.pg_conn.cursor()
+                    returned = execute_values(cur, INSERT_SQL, rows, page_size=BATCH, fetch=True)
+                    cur.close()
+
+                    chunk_pgid = {str(r[1]): r[0] for r in returned}
+                    uuid_pgid.update(chunk_pgid)
+                    # clave = (grupo, clase.id): identidad única de la sesión
+                    for g, i, u in zip(valid["grupo"].values, valid["id"].values, valid["uuid"].values):
+                        erp_uuid_map[(int(g), int(i))] = u
+
+                    migrated += len(returned)
+                    self.pg_conn.commit()
+                    pct = (total / total_rows * 100) if total_rows else 0
+                    logger.info(f"  group_sessions: {pct:5.1f}% ({total:,}/{total_rows:,} leídas) | {migrated:,} guardadas")
+
+            # session_map: dict {(grupo, clase.id) → pg group_session.id}
+            self.session_map = {
+                key: uuid_pgid[u] for key, u in erp_uuid_map.items() if u in uuid_pgid
+            }
+
+            self._log_step("group_sessions", migrated, total)
             if skipped:
                 logger.warning(f"  Omitidos sin grupo mapeado: {skipped}")
             return True
@@ -940,7 +972,7 @@ class AcademicMigrator:
                     "SELECT grupo, id_asistente AS usuario_id FROM grupo_x_asistente"
                     " WHERE id_asistente IS NOT NULL"
                 )
-                df_a["role"] = "ASSISTANT"
+                df_a["role"] = "TEACHER_ASSISTANT"  # enum GroupProfileRole no tiene ASSISTANT
                 frames.append(df_a)
             except Exception as err:
                 logger.warning(f"  grupo_x_asistente no disponible: {err}")
@@ -951,7 +983,7 @@ class AcademicMigrator:
                     "SELECT grupo, id_monitor AS usuario_id FROM grupo_x_monitor"
                     " WHERE id_monitor IS NOT NULL"
                 )
-                df_m["role"] = "MONITOR"
+                df_m["role"] = "TEACHER_ASSISTANT"  # enum GroupProfileRole no tiene MONITOR
                 frames.append(df_m)
             except Exception as err:
                 logger.warning(f"  grupo_x_monitor no disponible: {err}")
@@ -967,8 +999,17 @@ class AcademicMigrator:
             df = df.dropna(subset=["course_group_id", "profile_id"])
             skipped = total - len(df)
 
-            # Deduplicar (misma combinación grupo+perfil+rol)
-            df = df.drop_duplicates(subset=["course_group_id", "profile_id", "role"])
+            # group_profiles_uk = UNIQUE(course_group_id, profile_id): un perfil solo
+            # puede tener UN rol por grupo. Al deduplicar priorizamos el rol de mayor
+            # jerarquía (TEACHER > TEACHER_ASSISTANT > STUDENT). Además, distintos
+            # usuario_id del ERP pueden colapsar al mismo profile_id.
+            _role_prio = {"TEACHER": 0, "TEACHER_ASSISTANT": 1, "STUDENT": 2}
+            df = (
+                df.assign(_prio=df["role"].map(_role_prio).fillna(9))
+                  .sort_values("_prio")
+                  .drop_duplicates(subset=["course_group_id", "profile_id"], keep="first")
+                  .drop(columns="_prio")
+            )
 
             df["uuid"] = [
                 det_uuid("group_profile", f"{a}_{b}_{c}")
@@ -987,7 +1028,7 @@ class AcademicMigrator:
                     (uuid, course_group_id, profile_id, enrollment_role,
                      created_at, updated_at)
                 VALUES %s
-                ON CONFLICT (uuid) DO NOTHING
+                ON CONFLICT (course_group_id, profile_id) DO NOTHING
                 """,
                 rows,
             )
@@ -1014,14 +1055,17 @@ class AcademicMigrator:
         logger.info("MIGRANDO: group_profile_assistance  ←  asistencia_clase")
         try:
             sql = (
-                "SELECT ac.clase, ac.id_alumno, ac.tipo_asistencia, "
+                "SELECT ac.grupo, ac.clase, ac.id_alumno, ac.tipo_asistencia, "
                 "ac.created_at, ac.updated_at "
                 "FROM asistencia_clase ac "
-                "WHERE ac.clase IS NOT NULL AND ac.id_alumno IS NOT NULL "
-                "ORDER BY ac.clase, ac.id_alumno"
+                "WHERE ac.grupo IS NOT NULL AND ac.clase IS NOT NULL AND ac.id_alumno IS NOT NULL "
+                "ORDER BY ac.grupo, ac.clase, ac.id_alumno"
             )
 
-            PRESENT = {"1", "a", "asistio", "asistió", "p", "presente", "true"}
+            # tipo_asistencia es enum('PRESCENCIAL','VIRTUAL','VIDEO'): toda fila de
+            # asistencia_clase representa asistencia efectiva (en alguna modalidad).
+            PRESENT = {"prescencial", "presencial", "virtual", "video",
+                       "1", "a", "asistio", "asistió", "p", "presente", "true"}
             GPA_COLS = ["uuid", "group_session_id", "profile_id", "attended", "created_at", "updated_at"]
 
             # Crear tabla temporal reutilizable para COPY por chunks
@@ -1041,9 +1085,16 @@ class AcademicMigrator:
                     chunk_total = len(chunk)
                     total += chunk_total
 
-                    chunk["group_session_id"] = chunk["clase"].map(self.session_map)
+                    # session_map indexado por (grupo, clase): clase.id no es único global
+                    chunk["group_session_id"] = [
+                        self.session_map.get((int(g), int(c)))
+                        for g, c in zip(chunk["grupo"].values, chunk["clase"].values)
+                    ]
                     chunk["profile_id"]       = chunk["id_alumno"].map(self.profile_map)
                     chunk = chunk.dropna(subset=["group_session_id", "profile_id"])
+                    # group_profile_assistance_uk = UNIQUE(group_session_id, profile_id):
+                    # distintos id_alumno pueden colapsar al mismo profile_id.
+                    chunk = chunk.drop_duplicates(subset=["group_session_id", "profile_id"])
                     skipped += chunk_total - len(chunk)
 
                     chunk["attended"] = (
@@ -1051,8 +1102,9 @@ class AcademicMigrator:
                         .astype(str).str.strip().str.lower().isin(PRESENT)
                     )
                     chunk["uuid"] = [
-                        det_uuid("assistance", f"{a}_{b}")
-                        for a, b in zip(chunk["clase"].values, chunk["id_alumno"].values)
+                        det_uuid("assistance", f"{g}_{c}_{a}")
+                        for g, c, a in zip(chunk["grupo"].values, chunk["clase"].values,
+                                           chunk["id_alumno"].values)
                     ]
                     chunk["group_session_id"] = chunk["group_session_id"].astype(int)
                     chunk["profile_id"]       = chunk["profile_id"].astype(int)
@@ -1062,7 +1114,8 @@ class AcademicMigrator:
                     rows = to_records(chunk[GPA_COLS])
                     # COPY a temp + upsert desde temp → tabla real (más rápido que execute_values)
                     n = self._copy_insert(
-                        "group_profile_assistance", GPA_COLS, rows, conflict_col="uuid"
+                        "group_profile_assistance", GPA_COLS, rows,
+                        conflict_col="group_session_id, profile_id",
                     )
                     migrated += n
                     self.pg_conn.commit()   # commit por chunk: libera WAL y memoria
@@ -1077,45 +1130,25 @@ class AcademicMigrator:
             return False
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 10. course_media_resources  ←  material_materia  +  clase.url_video
+    # 10. course_media_resources  ←  clase.url_video
     # ──────────────────────────────────────────────────────────────────────────
 
     def migrate_course_media_resources(self) -> bool:
         logger.info("\n" + "=" * 60)
-        logger.info("MIGRANDO: course_media_resources  ←  material_materia + clase.url_video")
+        logger.info("MIGRANDO: course_media_resources  ←  clase.url_video")
         try:
-            # ── Materiales de materia
-            df_mat = self._rq(
-                """
-                SELECT m.id, m.titulo, m.url, m.t_material, m.vigente,
-                       m.formacion AS materia_id, m.fecha_trans AS created_at
-                FROM material_materia m
-                WHERE m.url IS NOT NULL AND m.url != ''
-                ORDER BY m.id
-                """
-            )
-            df_mat["resource_type"]   = df_mat["t_material"].map(self.t_material_ser).map(map_material_type).fillna("DOCUMENT")
-            df_mat["resource_status"] = df_mat["vigente"].fillna(0).astype(bool).map({True: "ACTIVE", False: "INACTIVE"})
-            df_mat["resource_scope"]  = "COURSE"
-            df_mat["course_id"]       = df_mat["materia_id"].map(self.course_map)
-            df_mat["name"]            = df_mat["titulo"].where(df_mat["titulo"].notna(), df_mat["url"])
-            df_mat["uuid"]            = [det_uuid("media_mat", str(x)) for x in df_mat["id"].values]
-            df_mat["created_at"]      = pd.to_datetime(df_mat["created_at"]).fillna(NOW)
-            df_mat["updated_at"]      = NOW
-
-            # ── Videos de clase (url_video)
+            # Fuente única: enlaces de sesión en clase.url_video.
+            # (material_materia está vacío en el ERP, por eso no se procesa.)
             df_vid = self._rq(
                 """
                 SELECT c.id AS clase_id, c.grupo, c.url_video AS url,
                        c.fecha_inicio AS created_at
                 FROM clase c
                 WHERE c.url_video IS NOT NULL AND c.url_video != ''
-                ORDER BY c.id
+                ORDER BY c.grupo, c.id
                 """
             )
-            # Descartar URLs ya cubiertas por material_materia
-            known_urls = set(df_mat["url"].dropna())
-            df_vid = df_vid[~df_vid["url"].isin(known_urls)].drop_duplicates(subset=["url"])
+            df_vid = df_vid.drop_duplicates(subset=["url"])
 
             grupo_materia = self._rq("SELECT id, materia FROM grupo WHERE materia IS NOT NULL")
             df_vid = df_vid.merge(
@@ -1123,18 +1156,20 @@ class AcademicMigrator:
                 on="grupo", how="left"
             )
             df_vid["course_id"]       = df_vid["materia_id"].map(self.course_map)
-            df_vid["name"]            = "Video — sesión " + df_vid["clase_id"].astype(str)
-            df_vid["resource_type"]   = "VIDEO"
+            df_vid["name"]            = "Sesión — grabación " + df_vid["clase_id"].astype(str)
+            # Enum CourseResourceType: VIDEO, LIVE_SESSION_LINK. Los url_video se
+            # tratan como enlaces externos de sesión → LIVE_SESSION_LINK.
+            df_vid["resource_type"]   = "LIVE_SESSION_LINK"
             df_vid["resource_status"] = "ACTIVE"
             df_vid["resource_scope"]  = "SESSION"
-            df_vid["uuid"]            = [det_uuid("media_video", str(x)) for x in df_vid["clase_id"].values]
+            df_vid["uuid"]            = [det_uuid("media_video", f"{g}_{i}")
+                                         for g, i in zip(df_vid["grupo"].values, df_vid["clase_id"].values)]
             df_vid["created_at"]      = pd.to_datetime(df_vid["created_at"]).fillna(NOW)
             df_vid["updated_at"]      = NOW
 
-            # Unificar ambas fuentes
-            shared_cols = ["uuid", "name", "url", "resource_type", "resource_status",
-                           "resource_scope", "course_id", "created_at", "updated_at"]
-            df_all = pd.concat([df_mat[shared_cols], df_vid[shared_cols]], ignore_index=True)
+            cols = ["uuid", "name", "url", "resource_type", "resource_status",
+                    "resource_scope", "course_id", "created_at", "updated_at"]
+            df_all = df_vid[cols].copy()
 
             # Descartar registros sin course_id (grupo sin materia o materia no migrada)
             before = len(df_all)
@@ -1143,7 +1178,6 @@ class AcademicMigrator:
             if dropped:
                 logger.warning(f"  Omitidos {dropped} recursos sin course_id mapeado")
 
-            # Deduplicar por uuid antes de insertar (mismo video puede aparecer en df_mat y df_vid)
             df_all = df_all.drop_duplicates(subset=["uuid"])
             df_all["course_id"] = df_all["course_id"].astype(int)
             rows = to_records(df_all)
@@ -1153,7 +1187,9 @@ class AcademicMigrator:
                     (uuid, name, url, resource_type, resource_status,
                      resource_scope, course_id, created_at, updated_at)
                 VALUES %s
-                ON CONFLICT (uuid) DO UPDATE SET url = EXCLUDED.url
+                ON CONFLICT (uuid) DO UPDATE
+                    SET url = EXCLUDED.url,
+                        resource_type = EXCLUDED.resource_type
                 RETURNING id, uuid
                 """,
                 rows,
@@ -1167,11 +1203,8 @@ class AcademicMigrator:
                 if uid in uuid_pgid
             }
 
-            self._log_step(
-                "course_media_resources", len(uuid_pgid),
-                len(df_mat) + len(df_vid)
-            )
-            logger.info(f"  Detalle: {len(df_mat)} materiales + {len(df_vid)} videos de clase")
+            self._log_step("course_media_resources", len(uuid_pgid), len(df_vid))
+            logger.info(f"  Detalle: {len(df_vid)} enlaces de clase.url_video → LIVE_SESSION_LINK")
             return True
 
         except Exception as err:
@@ -1191,15 +1224,19 @@ class AcademicMigrator:
         try:
             df = self._rq(
                 """
-                SELECT id AS clase_id, url_video AS url,
+                SELECT grupo, id AS clase_id, url_video AS url,
                        fecha_asistencia, fecha_inicio
                 FROM clase
                 WHERE url_video IS NOT NULL AND url_video != ''
-                ORDER BY id
+                ORDER BY grupo, id
                 """
             )
 
-            df["group_session_id"]  = df["clase_id"].map(self.session_map)
+            # session_map indexado por (grupo, clase.id): clase.id no es único global
+            df["group_session_id"]  = [
+                self.session_map.get((int(g), int(i)))
+                for g, i in zip(df["grupo"].values, df["clase_id"].values)
+            ]
             df["media_resource_id"] = df["url"].map(self.media_url_map)
             before = len(df)
             df = df.dropna(subset=["group_session_id", "media_resource_id"])
@@ -1209,8 +1246,8 @@ class AcademicMigrator:
                 df["fecha_asistencia"].where(df["fecha_asistencia"].notna(), df["fecha_inicio"])
             ).fillna(pd.NaT)
             df["uuid"] = [
-                det_uuid("session_video", f"{a}_{b[:64]}")
-                for a, b in zip(df["clase_id"].values, df["url"].values)
+                det_uuid("session_video", f"{g}_{a}_{b[:64]}")
+                for g, a, b in zip(df["grupo"].values, df["clase_id"].values, df["url"].values)
             ]
             df["group_session_id"]  = df["group_session_id"].astype(int)
             df["media_resource_id"] = df["media_resource_id"].astype(int)
@@ -1239,68 +1276,6 @@ class AcademicMigrator:
             self.pg_conn.rollback()
             logger.error(f"✗ group_session_videos: {err}")
             self.stats["errors"].append(f"group_session_videos: {err}")
-            return False
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 12. course_group_media_resources  (tabla pivote)
-    # merge pandas en lugar de loops anidados
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def migrate_course_group_media_resources(self) -> bool:
-        logger.info("\n" + "=" * 60)
-        logger.info("MIGRANDO: course_group_media_resources  (pivote grupos ↔ materiales)")
-        try:
-            df_mat = self._rq(
-                "SELECT url, formacion AS materia_id FROM material_materia"
-                " WHERE url IS NOT NULL AND url != ''"
-            )
-            df_grp = self._rq(
-                "SELECT id AS erp_grupo, materia FROM grupo WHERE materia IS NOT NULL"
-            )
-
-            # Merge: material → materia → grupos
-            df = df_mat.merge(
-                df_grp.rename(columns={"materia": "materia_id"}),
-                on="materia_id", how="inner"
-            )
-
-            df["media_resource_id"] = df["url"].map(self.media_url_map)
-            df["course_group_id"]   = df["erp_grupo"].map(self.group_map)
-            df = df.dropna(subset=["media_resource_id", "course_group_id"])
-
-            # Deduplicar el producto cruzado
-            df = df.drop_duplicates(subset=["course_group_id", "media_resource_id"])
-
-            df["course_group_id"]   = df["course_group_id"].astype(int)
-            df["media_resource_id"] = df["media_resource_id"].astype(int)
-            df["uuid"] = [
-                det_uuid("cgmr", f"{a}_{b}")
-                for a, b in zip(df["course_group_id"].values, df["media_resource_id"].values)
-            ]
-            df["released_at"]       = None
-            df["created_at"]        = NOW
-            df["updated_at"]        = NOW
-
-            rows = to_records(df[["uuid", "course_group_id", "media_resource_id",
-                                   "released_at", "created_at", "updated_at"]])
-            self._bulk_write(
-                """
-                INSERT INTO course_group_media_resources
-                    (uuid, course_group_id, media_resource_id,
-                     released_at, created_at, updated_at)
-                VALUES %s
-                ON CONFLICT (uuid) DO NOTHING
-                """,
-                rows,
-            )
-            self.pg_conn.commit()
-            self._log_step("course_group_media_resources", len(rows), len(rows))
-            return True
-
-        except Exception as err:
-            self.pg_conn.rollback()
-            logger.error(f"✗ course_group_media_resources: {err}")
-            self.stats["errors"].append(f"course_group_media_resources: {err}")
             return False
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -1337,7 +1312,6 @@ class AcademicMigrator:
                 ("group_profile_assistance",     self.migrate_group_profile_assistance),
                 ("course_media_resources",       self.migrate_course_media_resources),
                 ("group_session_videos",         self.migrate_group_session_videos),
-                ("course_group_media_resources", self.migrate_course_group_media_resources),
             ]
 
             for name, step in steps:

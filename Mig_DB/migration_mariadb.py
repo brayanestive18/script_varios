@@ -346,6 +346,7 @@ class MariaDBMigrator:
                     ON CONFLICT (provider_auth_id) DO NOTHING
                     """,
                     rows_usuario,
+                    page_size=1000,
                 )
                 # Reconstruir mapa (id, dni) → pg_users.id usando provider_auth_id
                 provider_ids = list(key_to_provider.values())
@@ -383,7 +384,9 @@ class MariaDBMigrator:
 
             for u in auth_users:
                 provider_id = f"erp_auth_{u['id']}"
-                email = u["email"] or f"{u['id']}@noemail.co"
+                raw_email = u["email"] or f"{u['id']}@noemail.co"
+                email = f"{u['id']}.dup.{raw_email}" if raw_email in seen_emails else raw_email
+                seen_emails.add(email)
                 u_uuid = det_uuid("auth_user", str(u["id"]))
 
                 rows_auth.append((
@@ -408,6 +411,7 @@ class MariaDBMigrator:
                     ON CONFLICT (provider_auth_id) DO NOTHING
                     """,
                     rows_auth,
+                    page_size=1000,
                 )
                 provider_ids = list(auth_key_to_provider.values())
                 pg_cur.execute(
@@ -491,6 +495,7 @@ class MariaDBMigrator:
                     ON CONFLICT (user_id, role_id) DO NOTHING
                     """,
                     to_insert,
+                    page_size=1000,
                 )
 
             self.postgres_conn.commit()
@@ -557,6 +562,7 @@ class MariaDBMigrator:
 
             # uuid → key ERP para reconstruir el mapa después del insert
             uuid_to_key: Dict[str, Tuple[int, int]] = {}
+            to_insert: list = []
 
             for u in rows:
                 key = (u["id"], u["dni"])
@@ -569,39 +575,42 @@ class MariaDBMigrator:
                 genero_raw = u.get("genero")
                 gender = GENDER_MAP.get(str(genero_raw).strip(), None) if genero_raw else None
 
-                pg_id = self._insert_one_with_savepoint(
+                to_insert.append((
+                    profile_uuid,
+                    pg_user_id,
+                    u["nombre1"],
+                    u.get("nombre2"),
+                    u["apellido1"],
+                    u.get("apellido2"),
+                    gender,
+                    u.get("fecha_nacimiento"),
+                    u.get("telefono"),
+                    u.get("celular"),
+                    u.get("imagen"),
+                    u["created_at"] or NOW,
+                    u["updated_at"] or NOW,
+                ))
+                uuid_to_key[profile_uuid] = key
+
+            # Inserción masiva: una sola sentencia por lote en lugar de fila a fila
+            # con SAVEPOINT (elimina ~3 round-trips por registro).
+            if to_insert:
+                execute_values(
                     pg_cur,
                     """
                     INSERT INTO profiles
                         (uuid, user_id, first_name, middle_name,
                          last_name, second_last_name, gender, birth_date,
                          "homePhoneNumber", "mobilePhoneNumber", avatar_url, created_at, updated_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES %s
                     ON CONFLICT (uuid) DO NOTHING
-                    RETURNING id
                     """,
-                    (
-                        profile_uuid,
-                        pg_user_id,
-                        u["nombre1"],
-                        u.get("nombre2"),
-                        u["apellido1"],
-                        u.get("apellido2"),
-                        gender,
-                        u.get("fecha_nacimiento"),
-                        u.get("telefono"),
-                        u.get("celular"),
-                        u.get("imagen"),
-                        u["created_at"] or NOW,
-                        u["updated_at"] or NOW,
-                    ),
+                    to_insert,
+                    page_size=1000,
                 )
-                if pg_id:
-                    self.profile_id_map[key] = pg_id
-                    migrated += 1
-                uuid_to_key[profile_uuid] = key
 
-            # Recuperar IDs de profiles que ya existían (ON CONFLICT DO NOTHING no retorna)
+            # Reconstruir profile_id_map con un solo SELECT por uuid (cubre filas
+            # recién insertadas y preexistentes; ON CONFLICT DO NOTHING no retorna)
             if uuid_to_key:
                 uuids = list(uuid_to_key.keys())
                 pg_cur.execute(
@@ -609,9 +618,8 @@ class MariaDBMigrator:
                     (uuids,),
                 )
                 for pg_id, pg_uuid in pg_cur.fetchall():
-                    key = uuid_to_key[pg_uuid]
-                    if key not in self.profile_id_map:
-                        self.profile_id_map[key] = pg_id
+                    self.profile_id_map[uuid_to_key[pg_uuid]] = pg_id
+                migrated = sum(1 for k in uuid_to_key.values() if k in self.profile_id_map)
 
             self.postgres_conn.commit()
             pg_cur.close()
@@ -696,6 +704,7 @@ class MariaDBMigrator:
                     ON CONFLICT (uuid) DO NOTHING
                     """,
                     to_insert,
+                    page_size=1000,
                 )
 
             self.postgres_conn.commit()
@@ -779,6 +788,7 @@ class MariaDBMigrator:
                     ON CONFLICT (uuid) DO NOTHING
                     """,
                     to_insert,
+                    page_size=1000,
                 )
 
             self.postgres_conn.commit()
@@ -855,6 +865,7 @@ class MariaDBMigrator:
                     ON CONFLICT (profile_id) DO NOTHING
                     """,
                     to_insert,
+                    page_size=1000,
                 )
 
             self.postgres_conn.commit()
@@ -952,6 +963,7 @@ class MariaDBMigrator:
                     ON CONFLICT (uuid) DO NOTHING
                     """,
                     to_insert,
+                    page_size=1000,
                 )
 
             self.postgres_conn.commit()
