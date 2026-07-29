@@ -8,3 +8,6 @@
 *.xlsx
 .DS_Store
 **/*.log
+*.log
+**/env
+**/__pycache__/
